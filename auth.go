@@ -18,17 +18,20 @@ var authDb = &persist.Database{}
 var standAlone = true
 var dropAll = false
 
-func init() {
-	if standAlone {
-		authDb.ConfigEnvWPrefix("AUTH", false)
-		authDb.Connect()
+var initialized = false
 
-		if dropAll {
+func init() {
+	authDb.ConfigEnvWPrefix("AUTH", false)
+}
+
+// perform the setup steps post flag processing
+func authDbConfigure() {
+	authDb.Connect()
+	if authDb.SchemaInitialize {
+		if authDb.DropSchema {
 			authDb.DropAll(AuthSchema)
 		}
-		if authDb.SchemaInitialize {
-			authDb.Initialize(AuthSchema)
-		}
+		authDb.Initialize(AuthSchema)
 	}
 }
 
@@ -134,7 +137,7 @@ func (auth *Auth) CopyKey(from *Auth) {
 }
 
 // Create a row in a table
-func (auth *Auth) Create() {
+func (auth *Auth) Create() (err error) {
 	authDb := auth.db
 	// ignore DB & id
 	insert := fmt.Sprintf(`
@@ -158,13 +161,12 @@ VALUES ('%s', '%s', '%s', '%s', %d, '%s', '%s', CURRENT_TIMESTAMP, CURRENT_TIMES
 		auth.Key,
 		auth.Totp,
 	)
-	fmt.Println(insert)
-	fmt.Println(authDb.Exec(insert))
-	fmt.Println("Count", auth.Count())
+	_, err = authDb.Exec(insert)
+	return
 }
 
 // Read row from db using auth key fields for query
-func (auth *Auth) Read() bool {
+func (auth *Auth) Read() (err error) {
 	authDb := auth.db
 	// ignore DB & id
 	query := fmt.Sprintf(`
@@ -189,11 +191,13 @@ AND
 		auth.Email,
 		auth.Issuer,
 	)
-	fmt.Println(query)
-	rows := authDb.Query(query)
-	defer rows.Close()
-	for rows.Next() {
-		if err := rows.Scan(
+	var rows *sql.Rows
+	defer func() { _ = rows.Close() }()
+	if rows, err = authDb.Query(query); err != nil {
+		return
+	}
+	if rows.Next() {
+		err = rows.Scan(
 			&auth.ID,
 			&auth.GUID,
 			&auth.Email,
@@ -203,28 +207,13 @@ AND
 			&auth.Key,
 			&auth.Totp,
 			&auth.Created,
-			&auth.Changed); err != nil {
-			panic(fmt.Sprintf("%v", err))
-		}
-		fmt.Println(
-			auth.ID,
-			auth.GUID,
-			auth.Email,
-			auth.Issuer,
-			auth.Hash,
-			auth.Digits,
-			auth.Key,
-			auth.Totp,
-			auth.Created,
-			auth.Changed)
+			&auth.Changed)
 	}
-	count := auth.Count()
-	fmt.Println("Count", count)
-	return count != 0
+	return
 }
 
 // Update row from db using auth key fields
-func (auth *Auth) Update() {
+func (auth *Auth) Update() (err error) {
 	authDb := auth.db
 	// ignore DB & id
 	update := fmt.Sprintf(`
@@ -249,16 +238,14 @@ AND
 		auth.Email,
 		auth.Issuer,
 	)
-	var err error
 	var rows *sql.Rows
-	var result sql.Result
-	fmt.Println(update)
-	result, err = authDb.Exec(update)
-	fmt.Println("update result", result, "error", err)
-	rows = authDb.Query("SELECT * FROM auth")
-	defer rows.Close()
-	for rows.Next() {
-		if err := rows.Scan(
+	_, err = authDb.Exec(update)
+	if rows, err = authDb.Query("SELECT * FROM auth"); err != nil {
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	if rows.Next() {
+		err = rows.Scan(
 			&auth.ID,
 			&auth.GUID,
 			&auth.Email,
@@ -268,26 +255,13 @@ AND
 			&auth.Key,
 			&auth.Totp,
 			&auth.Created,
-			&auth.Changed); err != nil {
-			panic(fmt.Sprintf("%v", err))
-		}
-		fmt.Println(
-			auth.ID,
-			auth.GUID,
-			auth.Email,
-			auth.Issuer,
-			auth.Hash,
-			auth.Digits,
-			auth.Key,
-			auth.Totp,
-			auth.Created,
-			auth.Changed)
+			&auth.Changed)
 	}
-	fmt.Println("Count", auth.Count())
+	return
 }
 
 // Delete row from db using auth key fields
-func (auth *Auth) Delete() {
+func (auth *Auth) Delete() (err error) {
 	authDb := auth.db
 	// ignore DB & id
 	delete := fmt.Sprintf(`
@@ -302,16 +276,15 @@ AND
 		auth.Email,
 		auth.Issuer,
 	)
-	var err error
 	var rows *sql.Rows
-	var result sql.Result
-	fmt.Println(delete)
-	result, err = authDb.Exec(delete)
-	fmt.Println("delete result", result, "error", err)
-	rows = authDb.Query("SELECT * FROM auth")
-	defer rows.Close()
-	for rows.Next() {
-		if err := rows.Scan(
+	_, err = authDb.Exec(delete)
+	if err != nil {
+		return
+	}
+	rows, err = authDb.Query("SELECT * FROM auth")
+	defer func() { _ = rows.Close() }()
+	if rows.Next() {
+		err = rows.Scan(
 			&auth.ID,
 			&auth.GUID,
 			&auth.Email,
@@ -321,22 +294,9 @@ AND
 			&auth.Key,
 			&auth.Totp,
 			&auth.Created,
-			&auth.Changed); err != nil {
-			panic(fmt.Sprintf("%v", err))
-		}
-		fmt.Println(
-			auth.ID,
-			auth.GUID,
-			auth.Email,
-			auth.Issuer,
-			auth.Hash,
-			auth.Digits,
-			auth.Key,
-			auth.Totp,
-			auth.Created,
-			auth.Changed)
+			&auth.Changed)
 	}
-	fmt.Println("Count", auth.Count())
+	return
 }
 
 // Count rows for keys in auth
@@ -363,4 +323,17 @@ AND
 		log.Println("Row count query error", err)
 	}
 	return count
+}
+
+func (auth *Auth) String() string {
+	return fmt.Sprintf("ID %d GUID %s Email %s Issuer %s Hash %s Digits %d Key %s Created %s Changed %s",
+		auth.ID,
+		auth.GUID,
+		auth.Email,
+		auth.Issuer,
+		auth.Hash,
+		auth.Digits,
+		auth.Key,
+		auth.Created,
+		auth.Changed)
 }

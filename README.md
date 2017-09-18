@@ -1,7 +1,8 @@
 ##### Example twofactor library use
 
 - server.go runs a secure https/tls server that requires certificates
-
+- auth.go db access with debugging info still printed
+- version.go version variables
 
 ```
     # Replace example.com with your issuer

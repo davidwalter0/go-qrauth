@@ -24,63 +24,64 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/davidwalter0/go-cfg"
+	"github.com/davidwalter0/go-closer"
 	"github.com/davidwalter0/go-mutex"
+	"github.com/davidwalter0/go-tracer"
 	"github.com/davidwalter0/twofactor"
+
 	"golang.org/x/net/http2"
 )
 
 // debugging may leave unsafe breadcrumbs like files with secure
 // runtime info
 var debugging = false
-var monitor = mutex.NewMutex()
+var monitor = mutex.NewMonitor()
+var done = make(chan bool)
+var trace = tracer.New()
+var err error
 
-func main() {
-	Closer()
-	run()
+func init() {
+	if err = cfg.ProcessHoldFlags("APP", &app); err != nil {
+		log.Fatalf("%v\n", err)
+	}
 }
 
-// Closer handles signals and closes
-func Closer() {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	signal.Notify(c, syscall.SIGTERM)
-	signal.Notify(c, syscall.SIGKILL)
-	go func() {
-		fmt.Println("Closer before signal")
-		s := <-c
-		fmt.Println("Closer after signal", s)
-		authDb.Close()
-		fmt.Println("Closer after Close")
-		os.Exit(0)
-	}()
+func main() {
+	cfg.Freeze()
+	// if there are library loads or functionality that are issue
+	// dependent, then version should be executed before the load to
+	// force an exit prior to dependency failure
+	version()
+	authDbConfigure()
+
+	closer.Closer(done, closer.SampleChain)
+	go run()
+	<-done
 }
 
 func run() {
 	var jsonText []byte
-	var err error
-	if err = cfg.Parse(&app); err != nil {
-		log.Fatalf("%v\n", err)
-	}
 
 	jsonText, _ = json.MarshalIndent(&app, "", "  ")
 	protocol := "https://"
 
-	log.Printf("\nEnvironment configuration\n%v\n", string(jsonText))
-	log.Println("Answering requests on " + protocol + app.Host + ":" + app.Port)
+	if debugging {
+		log.Printf("\nEnvironment configuration\n%v\n", string(jsonText))
+		log.Println("Answering requests on " + protocol + app.Host + ":" + app.Port)
+	}
 
 	handler := My2FAGeneratorHandler{}
 	server := http.Server{
 		Addr:    app.Host + ":" + app.Port,
 		Handler: &handler,
 	}
-	http2.ConfigureServer(&server, &http2.Server{})
+	if err = http2.ConfigureServer(&server, &http2.Server{}); err != nil {
+		log.Fatal("error", err)
+	}
 	err = server.ListenAndServeTLS(app.Cert, app.Key)
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err)
@@ -151,7 +152,6 @@ func Result(account, issuer, token, status string) Results {
 
 // KeyResult returns the key + status as json
 func KeyResult(key, status string) KeyReponse {
-	log.Println("key:", key, "status:", status)
 	return KeyReponse{Key: key, Status: status}
 }
 
@@ -173,21 +173,17 @@ func WriteResult(account, issuer, token, status string, w http.ResponseWriter, c
 
 // Lookup issuer/account in issuerMap for the secrets map
 func Lookup(issuer, account string) (auth *Auth, err error) {
-	defer monitor.Monitor()()
+	defer monitor()()
 	if _, ok := issuerMap[issuer]; !ok {
 		issuerMap[issuer] = make(AccountMap)
 	}
 	accountMap := issuerMap[issuer]
-
 	if a, ok := accountMap[account]; !ok {
 		if auth = DBLookup(issuer, account); auth == nil {
 			err = fmt.Errorf("Issuer %s Account %s not found", issuer, account)
 			return
 		}
 	} else {
-		log.Println("************************************************************************")
-		log.Println("auth", a)
-		log.Println("************************************************************************")
 		auth = a
 	}
 	return
@@ -198,7 +194,9 @@ func Lookup(issuer, account string) (auth *Auth, err error) {
 func DBLookup(issuer, account string) (auth *Auth) {
 	auth = NewKey(account, issuer)
 	if auth.Exists() {
-		auth.Read()
+		if err := auth.Read(); err != nil {
+			log.Println(err)
+		}
 		auth.TotpRestore()
 	} else {
 		auth = nil
@@ -331,14 +329,12 @@ func Validate(w http.ResponseWriter, r *http.Request) {
 
 	if issuer, account, token, err = ParseValidationArgs(r); err != nil {
 		status = fmt.Sprintf("%v", err)
-		log.Println(status, http.StatusNotFound)
 		WriteResult(account, issuer, token, status, w, http.StatusNotFound)
 		return
 	}
 
 	if auth, err = Lookup(issuer, account); err != nil {
 		status = fmt.Sprintf("%v", err)
-		log.Println(status, http.StatusNotFound)
 		WriteResult(account, issuer, token, status, w, http.StatusNotFound)
 		return
 	}
@@ -350,12 +346,10 @@ func Validate(w http.ResponseWriter, r *http.Request) {
 		} else {
 			status = fmt.Sprintf("Fail %v token %s", err, token)
 		}
-		log.Println(status)
 		WriteResult(account, issuer, token, status, w, http.StatusUnauthorized)
 		return
 	}
 	status = "Successfully validated code"
-	log.Println(status)
 	WriteResult(account, issuer, token, status, w, http.StatusAccepted)
 	return
 }
@@ -363,10 +357,7 @@ func Validate(w http.ResponseWriter, r *http.Request) {
 // Exists check for entry of auth object in database
 func (auth *Auth) Exists() (ok bool) {
 	if auth.Count() == 1 {
-		log.Println("We have this guy in the db, skipping.")
 		ok = true
-	} else {
-		log.Println("Who's this guy?")
 	}
 	return
 }
@@ -377,7 +368,9 @@ func Qr2FAGenerator(w http.ResponseWriter, r *http.Request) {
 	var account, issuer, status string
 	var auth *Auth
 
-	log.Println("https://"+app.Host+":"+app.Port, r.Body, r)
+	if debugging {
+		log.Println("https://"+app.Host+":"+app.Port, r.Body, r)
+	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
 	w.Header().Set("Access-Control-Allow-Headers",
@@ -390,6 +383,8 @@ func Qr2FAGenerator(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("Issuer %s Account %s\n", issuer, account)
+
 	if auth, err = Lookup(issuer, account); err != nil {
 		auth = NewKey(account, issuer)
 
@@ -401,14 +396,16 @@ func Qr2FAGenerator(w http.ResponseWriter, r *http.Request) {
 		auth.TotpStore()
 		auth.Digits = Digits
 		auth.Hash = "sha1"
-		auth.Create()
-		auth.Read()
-		defer monitor.Monitor()()
+		if err := auth.Create(); err != nil {
+			log.Println(err)
+		}
+		if err := auth.Read(); err != nil {
+			log.Println(err)
+		}
+		defer monitor()()
 		if _, ok := issuerMap[issuer]; !ok {
 			issuerMap[issuer] = make(AccountMap)
 		}
-
-		log.Println("Who's this guy?")
 		issuerMap[issuer][account] = auth
 	}
 	w.Header().Set("Content-Type", "image/png")
@@ -418,9 +415,11 @@ func Qr2FAGenerator(w http.ResponseWriter, r *http.Request) {
 		_ = ioutil.WriteFile(auth.GUID+".png", auth.png, 0644)
 	}
 
-	log.Println("raw key: ", auth.key)
-	log.Println("b32key : ", auth.otp.KeyBase32())
-	log.Println(b64Encode(auth.totp))
+	if debugging {
+		log.Println("raw key: ", auth.key)
+		log.Println("b32key : ", auth.otp.KeyBase32())
+		log.Println(b64Encode(auth.totp))
+	}
 
 	if _, err = w.Write(auth.png); err != nil {
 		http.Error(w, "", http.StatusNotFound)
@@ -436,7 +435,9 @@ func KeyQuery(w http.ResponseWriter, r *http.Request) {
 	var err error
 	var data []byte
 
-	log.Println("https://"+app.Host+":"+app.Port, r.Body, r)
+	if debugging {
+		log.Println("https://"+app.Host+":"+app.Port, r.Body, r)
+	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
 	w.Header().Set("Access-Control-Allow-Headers",
@@ -450,8 +451,7 @@ func KeyQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if auth, err = Lookup(issuer, account); err == nil {
-		log.Println(auth.Key)
-		status = "Found issuer/account key"
+		status = fmt.Sprintf("Found Issuer %s/Account %s", issuer, account)
 		log.Println(status)
 		results := KeyResult(auth.Key, status)
 		if data, err = json.Marshal(&results); err == nil {
@@ -466,7 +466,7 @@ func KeyQuery(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, status, http.StatusNotFound)
 		}
 	} else {
-		status = fmt.Sprintf("issuer/account not found %v", err)
+		status = fmt.Sprintf("Issuer/Account not found %v", err)
 		log.Println(status, http.StatusNotFound)
 		http.Error(w, status, http.StatusNotFound)
 	}
@@ -501,6 +501,6 @@ func b64Decode(in string) (out []byte) {
 func CheckError(err error) {
 	if err != nil {
 		log.Println(err)
-		panic(err)
+		log.Println(err)
 	}
 }
