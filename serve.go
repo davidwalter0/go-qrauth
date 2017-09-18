@@ -43,6 +43,8 @@ var monitor = mutex.NewMonitor()
 var done = make(chan bool)
 var trace = tracer.New()
 var err error
+var traceEnable = false
+var traceDetail = false
 
 func init() {
 	if err = cfg.ProcessHoldFlags("APP", &app); err != nil {
@@ -52,6 +54,10 @@ func init() {
 
 func main() {
 	cfg.Freeze()
+	traceDetail = app.TraceDetailed
+	traceEnable = app.TraceEnabled
+
+	defer trace.Detailed(traceDetail).Enable(traceEnable).ScopedTrace()()
 	// if there are library loads or functionality that are issue
 	// dependent, then version should be executed before the load to
 	// force an exit prior to dependency failure
@@ -64,6 +70,7 @@ func main() {
 }
 
 func run() {
+	defer trace.Detailed(traceDetail).Enable(traceEnable).ScopedTrace()()
 	var jsonText []byte
 
 	jsonText, _ = json.MarshalIndent(&app, "", "  ")
@@ -102,10 +109,12 @@ var issuerMap = make(IssuerMap)
 
 // App application configuration struct
 type App struct {
-	Cert string
-	Key  string
-	Host string
-	Port string
+	Cert          string
+	Key           string
+	Host          string
+	Port          string
+	TraceDetailed bool
+	TraceEnabled  bool
 }
 
 var app App
@@ -113,6 +122,7 @@ var app App
 type My2FAGeneratorHandler struct{}
 
 func (h *My2FAGeneratorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer trace.Detailed(traceDetail).Enable(traceEnable).ScopedTrace()()
 	path := strings.Split(r.URL.Path, "/")
 	if len(path) > 1 {
 		switch path[1] {
@@ -291,6 +301,7 @@ func ParseTokenArgs(r *http.Request) (token string, err error) {
 
 // ParseArgs parse helper
 func ParseArgs(r *http.Request) (issuer, account string, err error) {
+	defer trace.Detailed(traceDetail).Enable(traceEnable).ScopedTrace()()
 	issuer = r.URL.Query().Get("issuer")
 	if issuer == "" {
 		err = errors.New("empty issuer missing option")
@@ -364,6 +375,7 @@ func (auth *Auth) Exists() (ok bool) {
 
 // Qr2FAGenerator create & return png
 func Qr2FAGenerator(w http.ResponseWriter, r *http.Request) {
+	defer trace.Detailed(traceDetail).Enable(traceEnable).ScopedTrace()()
 	var err error
 	var account, issuer, status string
 	var auth *Auth
@@ -429,6 +441,7 @@ func Qr2FAGenerator(w http.ResponseWriter, r *http.Request) {
 
 // KeyQuery .../key/?account=&issuer... -> key+status
 func KeyQuery(w http.ResponseWriter, r *http.Request) {
+	defer trace.Detailed(traceDetail).Enable(traceEnable).ScopedTrace()()
 	var account, issuer, status string
 
 	var auth *Auth
